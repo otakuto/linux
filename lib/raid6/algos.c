@@ -20,9 +20,12 @@
 #ifndef __KERNEL__
 #include <sys/mman.h>
 #include <stdio.h>
+#include <string.h>
 #else
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/gfp.h>
+#include <linux/string.h>
 #if !RAID6_USE_EMPTY_ZERO_PAGE
 /* In .bss so it's zeroed */
 const char raid6_empty_zero_page[PAGE_SIZE] __attribute__((aligned(256)));
@@ -32,6 +35,9 @@ EXPORT_SYMBOL(raid6_empty_zero_page);
 
 struct raid6_calls raid6_call;
 EXPORT_SYMBOL_GPL(raid6_call);
+
+static char *gen_algos;
+module_param(gen_algos, charp, 0000);
 
 const struct raid6_calls * const raid6_algos[] = {
 #if defined(__ia64__)
@@ -229,33 +235,52 @@ int __init raid6_select_algo(void)
 {
 	const int disks = (65536/PAGE_SIZE)+2;
 
-	const struct raid6_calls *gen_best;
+	const struct raid6_calls *gen_best = NULL;
 	const struct raid6_recov_calls *rec_best;
 	char *syndromes;
 	void *dptrs[(65536/PAGE_SIZE)+2];
 	int i;
 
-	for (i = 0; i < disks-2; i++)
-		dptrs[i] = ((char *)raid6_gfmul) + PAGE_SIZE*i;
+	if (gen_algos) {
+		const struct raid6_calls *const *algo;
 
-	/* Normal code - use a 2-page allocation to avoid D$ conflict */
-	syndromes = (void *) __get_free_pages(GFP_KERNEL, 1);
+		for (algo = raid6_algos; *algo; algo++) {
+			if (strcmp((*algo)->name, gen_algos))
+				continue;
+			if ((*algo)->valid && !(*algo)->valid())
+				continue;
 
-	if (!syndromes) {
-		pr_err("raid6: Yikes!  No memory available.\n");
-		return -ENOMEM;
+			gen_best = *algo;
+			pr_info("raid6: using preset algorithm %s\n",
+							gen_best->name);
+			raid6_call = *gen_best;
+			break;
+		}
 	}
 
-	dptrs[disks-2] = syndromes;
-	dptrs[disks-1] = syndromes + PAGE_SIZE;
+	if (!gen_best) {
+		for (i = 0; i < disks-2; i++)
+			dptrs[i] = ((char *)raid6_gfmul) + PAGE_SIZE*i;
 
-	/* select raid gen_syndrome function */
-	gen_best = raid6_choose_gen(&dptrs, disks);
+		/* Normal code - use a 2-page allocation to avoid D$ conflict */
+		syndromes = (void *) __get_free_pages(GFP_KERNEL, 1);
+
+		if (!syndromes) {
+			pr_err("raid6: Yikes!  No memory available.\n");
+			return -ENOMEM;
+		}
+
+		dptrs[disks-2] = syndromes;
+		dptrs[disks-1] = syndromes + PAGE_SIZE;
+
+		/* select raid gen_syndrome function */
+		gen_best = raid6_choose_gen(&dptrs, disks);
+
+		free_pages((unsigned long)syndromes, 1);
+	}
 
 	/* select raid recover functions */
 	rec_best = raid6_choose_recov();
-
-	free_pages((unsigned long)syndromes, 1);
 
 	return gen_best && rec_best ? 0 : -EINVAL;
 }
